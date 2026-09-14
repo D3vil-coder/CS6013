@@ -132,8 +132,8 @@ def main() -> int:
     new_state = {}
     for k, v in state.items():
         L = layer_of(k)
-        if L is not None and L in plan.keep:
-            keep_idx = torch.tensor(plan.keep[L], device=v.device)
+        if L is not None and L in plan.keep_idx:
+            keep_idx = torch.tensor(plan.keep_idx[L], device=v.device)
             if "down_proj" in k:
                 # [2560,9216] -> keep cols
                 new_state[k] = v[:, keep_idx].contiguous()
