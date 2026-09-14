@@ -61,9 +61,16 @@ def main() -> int:
         for q in MATH_PROMPTS[:N_CALIB]:
             msgs = [{"role": "user", "content": q + " Reason step by step, then give \\boxed{X}."}]
             try:
-                inp = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", enable_thinking=True).to(model.device)
+                enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", enable_thinking=True)
             except TypeError:
-                inp = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to(model.device)
+                enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
+            # handle BatchEncoding vs tensor
+            if isinstance(enc, dict):
+                inp = enc["input_ids"].to(model.device)
+            elif hasattr(enc, "input_ids"):
+                inp = enc.input_ids.to(model.device)
+            else:
+                inp = enc.to(model.device)
             out = model.generate(inp, max_new_tokens=MAX_NEW, do_sample=False)
             txt = tok.decode(out[0][inp.shape[1]:], skip_special_tokens=True)
             traces.append((q, txt))
@@ -83,28 +90,28 @@ def main() -> int:
     # For down, we treat column importance as mean over rows.
     for q, trace in traces[:16]:  # use subset for grad to save time (16 traces)
         full = q + " " + trace
-        enc = tok(full, return_tensors="pt").to(model.device)
-        # mask prompt tokens: only last len(trace) tokens are decode
-        # approximate: decode = last 1/2 of tokens
-        input_ids = enc["input_ids"]
+        enc = tok(full, return_tensors="pt")
+        if isinstance(enc, dict):
+            input_ids = enc["input_ids"].to(model.device)
+        elif hasattr(enc, "input_ids"):
+            input_ids = enc.input_ids.to(model.device)
+        else:
+            input_ids = enc.to(model.device)
         # forward
         out = model(input_ids=input_ids, labels=input_ids)
         loss = out.loss
         model.zero_grad()
         loss.backward()
+        # build param map once
+        param_map = dict(model.named_parameters())
         for k in keys:
             L = layer_of(k)
             if L is None:
                 continue
-            g = model.get_parameter(k.replace(".weight",".weight")).grad if hasattr(model, "get_parameter") else None
-            # fallback: get from named_parameters
-            if g is None:
-                for n,p in model.named_parameters():
-                    if n == k:
-                        g=p.grad
-                        break
-            if g is None:
+            p = param_map.get(k)
+            if p is None or p.grad is None:
                 continue
+            g = p.grad
             w = state[k].to(g.device).float()
             # per-neuron score: mean |g*w|
             if "down_proj" in k:
