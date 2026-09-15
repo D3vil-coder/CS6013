@@ -32,7 +32,7 @@ MATH_PROMPTS = [
  "What is 7 * 8?",
  "A train travels 60 km/h for 2 hours. Distance?",
  "If a+b=5 and a-b=1, find a",
-] * 7  # 70 prompts, we use first N_CALIB
+] * 8  # 64 prompts for self-generated CoT calibration
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -83,11 +83,9 @@ def main() -> int:
     keys = eligible_keys(list(state.keys()))
     # importance per layer: mean |grad * weight| per neuron
     imp: dict[int, list[float]] = {}
-    # init per neuron accum
-    from collections import defaultdict
-    acc = defaultdict(list)
     # we need to map weight to neuron: gate/up have shape [9216,2560] rows = neurons, down has [2560,9216] cols = neurons
     # For down, we treat column importance as mean over rows.
+    param_map = dict(model.named_parameters())
     for q, trace in traces[:16]:  # use subset for grad to save time (16 traces)
         full = q + " " + trace
         enc = tok(full, return_tensors="pt")
@@ -97,13 +95,15 @@ def main() -> int:
             input_ids = enc.input_ids.to(model.device)
         else:
             input_ids = enc.to(model.device)
+        # supervise only generated-token positions; prompt positions carry no loss
+        prompt_len = len(tok(q, add_special_tokens=False)["input_ids"])
+        labels = input_ids.clone()
+        labels[:, :prompt_len] = -100
+        model.zero_grad(set_to_none=True)
         # forward
-        out = model(input_ids=input_ids, labels=input_ids)
+        out = model(input_ids=input_ids, labels=labels)
         loss = out.loss
-        model.zero_grad()
         loss.backward()
-        # build param map once
-        param_map = dict(model.named_parameters())
         for k in keys:
             L = layer_of(k)
             if L is None:
@@ -149,7 +149,7 @@ def main() -> int:
     # text_config intermediate_size
     if "text_config" in cfg and "intermediate_size" in cfg["text_config"]:
         old = cfg["text_config"]["intermediate_size"]
-        new = int(old * KEEP_RATIO)
+        new = len(next(iter(plan.keep_idx.values())))
         cfg["text_config"]["intermediate_size"] = new
         print(f"[resp] intermediate {old} -> {new}", flush=True)
     # also need to update model.safetensors + config
