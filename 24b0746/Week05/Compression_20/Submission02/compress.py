@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
-from safetensors.torch import save_file
 from transformers import AutoTokenizer, AutoModelForImageTextToText
 
 from compression.resp import build_plan, eligible_keys, layer_of
@@ -128,46 +126,61 @@ def main() -> int:
     # build plan
     plan = build_plan(imp, keep_ratio=KEEP_RATIO)
     print(f"[resp] pruning {plan.pruned} neurons, keeping {plan.kept}", flush=True)
-    # 3) apply pruning: create new state with pruned weights
-    new_state = {}
+
+    def _is_visual_key(name: str) -> bool:
+        n = name.replace("\\", "/").lower()
+        if "visual." in n:
+            return True
+        return any(p in {"visual", "vision", "vision_tower", "vision_model"} for p in n.split("."))
+
+    def _set_param(root: torch.nn.Module, full_name: str, tensor: torch.Tensor) -> None:
+        *mods, attr = full_name.split(".")
+        m = root
+        for x in mods:
+            m = getattr(m, x)
+        setattr(m, attr, torch.nn.Parameter(tensor))
+
+    # 3) apply pruning in place so tied weights remain handled by transformers
+    orig_text_params = 0
+    saved_params = 0
     for k, v in state.items():
+        if _is_visual_key(k) or k == "lm_head.weight":
+            continue
+        orig_text_params += v.numel()
         L = layer_of(k)
         if L is not None and L in plan.keep_idx:
             keep_idx = torch.tensor(plan.keep_idx[L], device=v.device)
             if "down_proj" in k:
                 # [2560,9216] -> keep cols
-                new_state[k] = v[:, keep_idx].contiguous()
+                pruned = v[:, keep_idx].contiguous()
             else:
-                new_state[k] = v[keep_idx, :].contiguous()
-        else:
-            new_state[k] = v
-    # fix config: update intermediate_size
-    # need to copy config and adjust
-    import json as js
-    cfg_path = Path(src) / "config.json"
-    cfg = js.loads(cfg_path.read_text())
-    # text_config intermediate_size
-    if "text_config" in cfg and "intermediate_size" in cfg["text_config"]:
-        old = cfg["text_config"]["intermediate_size"]
-        new = len(next(iter(plan.keep_idx.values())))
-        cfg["text_config"]["intermediate_size"] = new
-        print(f"[resp] intermediate {old} -> {new}", flush=True)
-    # also need to update model.safetensors + config
-    # save
-    # we save as single shard for simplicity (fits)
-    save_file({k: v.to(torch.bfloat16) for k,v in new_state.items()}, str(dst / "model.safetensors"))
-    (dst / "config.json").write_text(js.dumps(cfg, indent=2))
-    # copy tokenizer files
-    for p in Path(src).glob("*.json"):
-        if p.name not in {"config.json"}:
-            shutil.copy2(p, dst / p.name)
-    for p in Path(src).glob("*.py"):
-        shutil.copy2(p, dst / p.name)
+                pruned = v[keep_idx, :].contiguous()
+            saved_params += v.numel() - pruned.numel()
+            _set_param(model, k, pruned.to(v.dtype))
+    # fix config: update intermediate_size to the actual kept width
+    text_cfg = getattr(model.config, "text_config", model.config)
+    old = int(text_cfg.intermediate_size)
+    new = len(next(iter(plan.keep_idx.values())))
+    text_cfg.intermediate_size = new
+    if hasattr(model, "language_model") and hasattr(model.language_model, "config"):
+        try:
+            model.language_model.config.intermediate_size = new
+        except Exception:
+            pass
+    print(f"[resp] intermediate {old} -> {new}", flush=True)
+    # release calibration memory before saving
+    model.zero_grad(set_to_none=True)
+    model.eval()
+    del state, param_map, imp, traces
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    # save a standard sharded HF checkpoint; save_pretrained handles tied weights
+    model.save_pretrained(str(dst), safe_serialization=True, max_shard_size="2GB")
+    tok.save_pretrained(str(dst))
     # meta
-    (dst / "compression_meta.json").write_text(json.dumps({"method":"resp_mlp_width","keep_ratio":KEEP_RATIO,"intermediate_pruned":plan.pruned}, indent=2))
-    # size report
-    text_bits = sum(v.numel()*16 for k,v in new_state.items() if "visual." not in k.lower())
-    frac = text_bits/8/1024**3/8.0585
+    new_text_params = orig_text_params - saved_params
+    frac = (new_text_params * 2) / (8.0585 * 1024**3)
+    (dst / "compression_meta.json").write_text(json.dumps({"method": "resp_mlp_width", "keep_ratio": KEEP_RATIO, "intermediate_old": old, "intermediate_new": new, "intermediate_pruned": plan.pruned, "size_frac": frac}, indent=2))
     print(f"[resp] done frac={frac:.4f}", flush=True)
     return 0
 
