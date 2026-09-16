@@ -6,7 +6,11 @@ from dataclasses import dataclass
 
 GROUP_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
 
-PROTECTED = {0, 1, 30, 31}
+# NOTE: uniform width is required because transformers uses a single
+# text_config.intermediate_size for every layer. Protecting layers while
+# shrinking the rest would produce an unloadable checkpoint, so all text
+# layers are pruned to the same kept width.
+PROTECTED = set()
 H, I = 2560, 9216
 
 def layer_of(k: str) -> int | None:

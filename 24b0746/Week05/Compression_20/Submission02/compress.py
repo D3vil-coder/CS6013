@@ -125,6 +125,32 @@ def main() -> int:
 
     # build plan
     plan = build_plan(imp, keep_ratio=KEEP_RATIO)
+    # Every text layer must end up at the same width, otherwise the saved
+    # checkpoint cannot be loaded with a single intermediate_size. Fill any
+    # layer missing gradient importance with a weight-magnitude fallback.
+    text_cfg_probe = getattr(model.config, "text_config", model.config)
+    num_layers = int(text_cfg_probe.num_hidden_layers)
+    old_inter = int(text_cfg_probe.intermediate_size)
+    keep_n = int(old_inter * KEEP_RATIO)
+    for L in range(num_layers):
+        if L in plan.keep_idx:
+            continue
+        scores = None
+        for suffix, dim in (("gate_proj", 1), ("up_proj", 1), ("down_proj", 0)):
+            kk = f"model.language_model.layers.{L}.mlp.{suffix}.weight"
+            if kk not in state:
+                continue
+            s = state[kk].detach().to(torch.float32).abs().mean(dim=dim)
+            s = s.detach().cpu().float().tolist()
+            scores = s if scores is None else [a + b for a, b in zip(scores, s)]
+        if scores is None:
+            continue
+        idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:keep_n]
+        plan.keep_idx[L] = sorted(idx)
+        plan.pruned += len(scores) - keep_n
+        plan.kept += keep_n
+        print(f"[resp] layer {L}: magnitude fallback (no grads)", flush=True)
+    assert set(plan.keep_idx.keys()) == set(range(num_layers)), "plan must cover all layers"
     print(f"[resp] pruning {plan.pruned} neurons, keeping {plan.kept}", flush=True)
 
     def _is_visual_key(name: str) -> bool:
@@ -144,7 +170,7 @@ def main() -> int:
     orig_text_params = 0
     saved_params = 0
     for k, v in state.items():
-        if _is_visual_key(k) or k == "lm_head.weight":
+        if _is_visual_key(k):
             continue
         orig_text_params += v.numel()
         L = layer_of(k)
