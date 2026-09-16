@@ -169,9 +169,17 @@ def main() -> int:
     # 3) apply pruning in place so tied weights remain handled by transformers
     orig_text_params = 0
     saved_params = 0
+    seen_storages = set()
     for k, v in state.items():
         if _is_visual_key(k):
             continue
+        try:
+            stor_key = (str(v.device), v.untyped_storage().data_ptr())
+        except Exception:
+            stor_key = ("obj", id(v))
+        if stor_key in seen_storages:
+            continue
+        seen_storages.add(stor_key)
         orig_text_params += v.numel()
         L = layer_of(k)
         if L is not None and L in plan.keep_idx:
