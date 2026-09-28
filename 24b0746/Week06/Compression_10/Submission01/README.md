@@ -26,4 +26,4 @@ python decompress.py --model_name Qwen-3.5-4B \
 ```
 
 The decompressed checkpoint is a standard single-shard
-`model.safetensors` (bf16) plus the copied config/tokenizer files.
+`model.safetensors (fp16) plus the copied config/tokenizer files.

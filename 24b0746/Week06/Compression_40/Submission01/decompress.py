@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decompress to fp16/bf16 (offline; no downloads).
+"""Decompress to fp16 (offline; no downloads).
 
 Usage:
     python decompress.py --model_name Qwen-3.5-4B \
@@ -51,7 +51,7 @@ def main() -> int:
             for k in h.keys():
                 scales[k] = h.get_tensor(k)
 
-    print("[decompress] reconstructing bf16 weights...", flush=True)
+    print("[decompress] reconstructing fp16 weights...", flush=True)
     out: dict[str, torch.Tensor] = {}
     with safe_open(str(weights), framework="pt", device="cpu") as h:
         for k in h.keys():
@@ -61,7 +61,7 @@ def main() -> int:
                     t, scales[k + ".qscale"], group_size=group_size
                 ).contiguous()
             else:
-                out[k] = t.to(torch.bfloat16).contiguous()
+                out[k] = t.to(torch.float16).contiguous()
 
     dst.mkdir(parents=True, exist_ok=True)
     save_file(out, str(dst / "model.safetensors"))
